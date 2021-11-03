@@ -23,12 +23,12 @@ explain what they are doing.
 """
 module OddArrays
 export OddArray, UnitVector, Rotation, AntiSymOne, LogRange, Vandermonde, Outer, Mask, Full, Alphabet, Range, PDiagMat,
-    ONEGRAD, TangentOrNT, uncollect, _uncollect, naturalise, restrict,
+    ONEGRAD, TangentOrNT, uncollect, _uncollect, naturalise, restrict, subspacetest,
     _getindex, _collect, _getfield, _mul, _det, _prod, _sum, _inv
 
 using Statistics, LinearAlgebra
 
-using ChainRulesCore, Zygote
+using ChainRulesCore, Zygote, ForwardDiff
 using Zygote: OneElement
 export ProjectTo, Tangent, NoTangent, ZeroTangent, rrule,  # CRC
     Zygote, gradient, pullback, OneElement,  # Zygote
@@ -41,7 +41,9 @@ function Base.NamedTuple(x::OddArray)
     NamedTuple{F}(map(f -> getfield(x, f), F))
 end
 
-#==== gradient stuff =====#
+#####
+##### Gradient setup
+#####
 
 _collect(x::AbstractArray) = reshape([_getindex(x, I.I...) for I in CartesianIndices(size(x))], size(x))
 Base.collect(x::OddArray) = _collect(x)  # not sure I need this
@@ -87,6 +89,11 @@ function _uncollect(dx::AbstractArray, x::AbstractArray)
     back(dx)[1]
 end
 
+"""
+    ProjectTo(::OddArray)
+
+The default projector makes a `Tangent`, using `uncollect`.
+"""
 ChainRulesCore.ProjectTo(x::OddArray) = ProjectTo{OddArray}(; x = x)
 function (p::ProjectTo{OddArray})(dx::AbstractArray)
     @info "projecting to Tangent{$(typeof(p.x).name.name)}" typeof(dx)
@@ -381,36 +388,57 @@ julia> ans == Outer([1,2], [30,40,50])
 true
 ```
 """
-struct Outer{T,X,Y} <: OddArray{T,2}
+struct Outer{X,Y,T} <: OddArray{T,2}  # T last to dispatch on X,Y easily
     x::X
     y::Y
     size::Tuple{Int,Int}
     function Outer(x::X, y::Y) where {X,Y}
         z = x * y'
+        T = isreal(z) ? real(eltype(z)) : eltype(z)
         z isa AbstractMatrix || throw("expected that x * y' be a matrix")
-        new{eltype(z),X,Y}(x, y, size(z))
+        new{X,Y,T}(x, y, size(z))
     end
 end
 
 Base.size(o::Outer) = o.size
 
 Base.getindex(o::Outer, i::Int, j::Int) = _getindex(o, i, j)
-_getindex(o::Outer, i, j) = (o.x * o.y')[i, j]
-_getindex(o::Outer{<:Any,<:AbstractVector,<:AbstractVector}, i, j) = o.x[i] * o.y[j]'
-_getindex(o::Outer{<:Any,<:AbstractMatrix,<:Number}, i, j) = o.x[i,j] * o.y'
-_getindex(o::Outer{<:Any,<:Number,<:AbstractMatrix}, i, j) = o.x * o.y[j,i]'
-_getindex(o::Outer{<:Any,<:AbstractMatrix,<:AbstractMatrix}, i, j) = sum(o.x[i,k] * o.y[j,k]' for k in axes(o.x,2))
+_getindex(o::Outer, i, j) = convert(eltype(o), (o.x * o.y')[i, j])
+_getindex(o::Outer{<:AbstractVector,<:AbstractVector}, i, j) = convert(eltype(o), o.x[i] * o.y[j]')
+_getindex(o::Outer{<:AbstractMatrix,<:Number}, i, j) = convert(eltype(o), o.x[i,j] * o.y')
+_getindex(o::Outer{<:Number,<:AbstractMatrix}, i, j) = convert(eltype(o), o.x * o.y[j,i]')
+_getindex(o::Outer{<:AbstractMatrix,<:AbstractMatrix}, i, j) = convert(eltype(o), sum(o.x[i,k] * o.y[j,k]' for k in axes(o.x,2)))
 
-Base.showarg(io::IO, o::Outer, top=true) = print(io, typeof(o), top ? ", storing $(length(o.x) + length(o.y)) numbers" : "")
+Base.showarg(io::IO, o::Outer, top=true) = print(io, typeof(o), top ? ", storing $(length(o.x) + length(o.y)) numbers, norm(x) = $(norm(o.x))" : "")
 
 #==== gradient stuff =====#
 
-uncollect(dz::AbstractMatrix, o::Outer{<:Any,<:AbstractVector,<:AbstractVector}) =
+uncollect(dz::AbstractMatrix, o::Outer{<:AbstractVector,<:AbstractVector}) =
     (; x = dz * o.y, y = dz' * o.x, size=nothing)
-uncollect(dz::AbstractMatrix, o::Outer{<:Any,<:AbstractMatrix,<:Number}) =
+uncollect(dz::AbstractMatrix, o::Outer{<:AbstractMatrix,<:Number}) =
     (; x=dz .* o.y, y=dot(dz, o.x), size=nothing)  # wrong for complex numbers?
-uncollect(dz::AbstractMatrix, o::Outer{<:Any,<:Number,<:AbstractMatrix}) =
+uncollect(dz::AbstractMatrix, o::Outer{<:Number,<:AbstractMatrix}) =
     (; x=dot(dz, o.y'), y=dz' .* o.x, size=nothing)  # wrong for complex numbers?
+
+function naturalise(dz::TangentOrNT, o::Outer{<:AbstractVector,<:AbstractVector})
+    M0 = dz.x / o.y
+    N = nullspace(o.y')'
+    A = o.x' \ (dz.y' - o.x' * M0) / N
+    M = M0 + A * N
+end
+function naturalise(dz::TangentOrNT, o::Outer{<:AbstractMatrix,<:Number})
+    dz.x ./ o.y  # could trivially make this an Outer
+end
+
+#=
+
+
+
+
+
+
+
+=#
 
 """
     Mask(α, β)
@@ -740,7 +768,7 @@ _step(r) = (_getfield(r, :stop) - _getfield(r, :start))/(_getfield(r, :len) - 1)
 Base.first(r::Range) = _getfield(r, :start)
 Base.last(r::Range) = _getfield(r, :stop)
 
-Base.showarg(io::IO, r::Range, top=true) = print(io, "Range{", eltype(r), "}", top ? ", with step = $(step(r))" : "")
+Base.showarg(io::IO, r::Range, top=true) = print(io, typeof(r), top ? ", with step = $(step(r))" : "")
 
 #==== optimisations of generic functions =====#
 
@@ -759,22 +787,26 @@ end
 function uncollect(dz::AbstractVector, ::Type{<:Range})
     start = dot(dz, LinRange(1,0,length(dz)))
     stop = dot(dz, LinRange(0,1,length(dz)))
+    @assert isapprox(start, -stop + sum(dz), atol=1e-13)  # so you can simplify a bit
     len = nothing
     (; start, stop, len)
 end
 
-# restrict(dz::AbstractVector, r::Range) = length(dz) == r.len ? restrict(dz, typeof(r)) : throw("dimensionmismatch!")
-# function restrict(dz::AbstractVector, ::Type{<:Range})
-#     μ = mean(dz)
-#     δ = (dz[end] - dz[begin])/2
-#     Range(μ - δ, μ + δ, length(dz))
-# end
+function restrict(dz::AbstractVector, ::Type{<:Range})
+    α = dot(dz, LinRange(1,0,length(dz)))
+    β = dot(dz, LinRange(0,1,length(dz)))  # can mix this into next formula but nothing nice happens
+    @assert isapprox(α, -β + sum(dz), atol=1e-13)
+    ℓ = length(dz)
+    start = ( 2(2ℓ-1)α - 2(ℓ-2)β )/( ℓ*(ℓ+1) )
+    stop = ( 2(2ℓ-1)β - 2(ℓ-2)α )/( ℓ*(ℓ+1) )
+    Range(start, stop, ℓ)
+end
 
 function naturalise(dz::TangentOrNT, r::Range)
     α, β = dz.start, dz.stop
     ℓ = length(r)
-    start = (4(ℓ^2)*(α+β) - 2ℓ*(α+4β) + 6β) / (ℓ*(ℓ+1))
-    stop = (- 2(ℓ^2)*(α+β) + 2ℓ*(2α+5β) - 6β) / (ℓ*(ℓ+1))
+    start = ( 2(2ℓ-1)α - 2(ℓ-2)β )/( ℓ*(ℓ+1) )
+    stop = ( 2(2ℓ-1)β - 2(ℓ-2)α )/( ℓ*(ℓ+1) )
     Range(start, stop, ℓ)
 end
 naturalise(dz::TangentOrNT, ::Type{<:Range}) = throw("naturalise needs the length of Range to produce")
@@ -786,30 +818,24 @@ function (p::ProjectTo{Range})(dx::AbstractVector)
     @info "projecting to Range" typeof(dx)
     restrict(dx, Range)
 end
-# function (p::ProjectTo{Range})(dx::Tangent)
-#     @info "projecting Tangent -> Range"
-#     naturalise(dx, Range(0,0,p.len))
-# end
+function (p::ProjectTo{Range})(dx::Tangent)
+    @info "projecting Tangent -> Range"
+    naturalise(dx, Range(0,0,p.len))
+end
 
-# function ChainRulesCore.rrule(::Type{<:Range}, start, stop, len)
-#     # function unrange(dy::Range)
-#     #     @info "adjoint constructor for Range"
-#     #     @show dy.start
-#     #     @show dy.stop
-#     #     (NoTangent(), dy.start, dy.stop, ZeroTangent())
-#     # end
-#     function unrange(dy::AbstractVector)
-#         @info "adjoint constructor for Range" typeof(dy)
-#         ℓ = length(dy)
-#         μ = mean(dy)
-#         δ = sum(Base.splat(-), zip(dy, @view dy[2:end]))/2
-#         m = dot(dy, LinRange(1,0,ℓ))
-#         p = dot(dy, LinRange(0,1,ℓ))
-#         @show μ δ m p 
-#         (NoTangent(), p+m, p+m, ZeroTangent())
-#     end
-#     Range(start, stop, len), unrange
-# end
+function ChainRulesCore.rrule(::Type{<:Range}, start, stop, len)
+    # function unrange(dy::Range)
+    #     @info "adjoint constructor for Range"
+    #     # somewhere I had these worked out...
+    # end
+    function unrange(dy::AbstractVector)
+        @info "adjoint constructor for Range" typeof(dy)
+        α = dot(dy, LinRange(1,0,length(dy)))
+        β = dot(dy, LinRange(0,1,length(dy))) 
+        (NoTangent(), α, β, ZeroTangent())
+    end
+    Range(start, stop, len), unrange
+end
 
 
 #####
@@ -849,6 +875,37 @@ naturalise(dx::TangentOrNT, ::Type{<:Diagonal}) = Diagonal(dx.diag)
 
 #==== Symmetric =====#
 
+"""
+    Symmetric(data, uplo::Symbol=:U)
+
+This is an honorary OddArray. Note that it's over-parameterised in a trivial way,
+since the lower triangle of `x.data` is ignored, lower according to a field `x.uplo`.
+The type `Mask` here is a slightly less trivial version of that.
+```
+julia> x = Symmetric(rand(2,2), :L);  # primal
+
+julia> uncollect([11 22; 33 44], x)  # no choices
+(data = [11 0; 55 44], uplo = nothing)
+
+julia> naturalise(ans, x)
+2×2 Symmetric{Float64, Matrix{Float64}}:
+ 11.0  27.5
+ 27.5  44.0
+
+julia> uncollect(ans, x)
+(data = [11.0 0.0; 55.0 44.0], uplo = nothing)
+
+julia> restrict([11 22; 33 44],  x)
+2×2 Symmetric{Float64, Matrix{Float64}}:
+ 11.0  27.5
+ 27.5  44.0
+
+julia> uncollect(ans, x)
+(data = [11.0 0.0; 55.0 44.0], uplo = nothing)
+```
+"""
+Symmetric
+
 function _getindex(s::Symmetric, i::Int, j::Int)
     data = _getfield(s, :data)
     if s.uplo === 'U'
@@ -869,14 +926,100 @@ function uncollect(dx::AbstractMatrix, x::Symmetric)
 end
 uncollect(dx::AbstractMatrix, ::Type{<:Symmetric}) = throw("uncollect needs to see uplo field of Symmetric")
 
-restrict(dx::AbstractMatrix, x::Symmetric) = restrict(dx, typeof(x))
+restrict(dx::AbstractMatrix, x::Symmetric) = restrict(dx, typeof(x))  # Symmetric((dx .+ transpose(dx))./2, LinearAlgebra.sym_uplo(x.uplo))
 restrict(dx::AbstractMatrix, ::Type{<:Symmetric}) = Symmetric((dx .+ transpose(dx))./2)
 restrict(dx::Symmetric, ::Type{<:Symmetric}) = dx
 
+function naturalise(dx::TangentOrNT, x::Symmetric)
+    if x.uplo === 'U'
+        data = (UpperTriangular(dx.data) .+ transpose(UpperTriangular(dx.data))) ./ 2
+    else
+        data = (LowerTriangular(dx.data) .+ transpose(LowerTriangular(dx.data))) ./ 2
+    end
+    Symmetric(data, LinearAlgebra.sym_uplo(x.uplo))
+end
+naturalise(dx::Symmetric, ::Type{<:Symmetric}) = throw("naturalise needs to see uplo field of Symmetric")
 
 #####
-##### Piracy, for tests
+##### For testing things
 #####
+
+struct NonDiff{T} val::T end
+
+"""
+    subspacetest(f, w...)
+
+Given the constructor `f` and argumets / fields `w`,
+this constructs `x = f(w...)` which lives in some subspace `S`.
+
+Then it checks that `naturalise` maps into to something living in ``T^*_x S``
+
+Ignores arguments that are integers, or non-arrays.
+This function is far too complicated, it should take array `w`
+and let you write `subspacetest(w -> f(w[1:3], w[4:end]), w)` manually.
+"""
+function subspacetest(f, args...; kw...)
+    x = f(args...; kw...)
+    ndims(x) >= 1 || throw("can't do zero arrays")
+    U, S, _ = svd(_paramjac(x, f, args...))
+    mask = abs.(S) .> 1e-10
+    goods = eachcol(U[:, mask])
+    bads = eachcol(U[:, .!mask])
+    # Check those:
+    dx = 10randn(size(x)...)
+    dw = uncollect(dx, x)
+    indots = map(v -> dot(v, naturalise(dw, x)), goods)
+    outdots = map(v -> dot(v, naturalise(dw, x)), bads)
+    pass = true
+    name = typeof(x).name.name
+    if any(d -> abs(d)<(1e-5), indots)
+        @warn "some directions inside T*S aren't explored" 
+        pass = false
+    end
+    cout = count(d -> abs(d)>(1e-5), outdots)
+    if cout > 0
+        @warn "naturalise(dw, $name) has components in $cout directions outside T*S"
+        pass = false
+    end
+    pass && @info "naturalise(dw, $name) seems to live in T*S, as it should"
+    (; pass, x, dx, dw, indots, outdots)
+end
+
+function _paramjac(x, f, args...)
+    wvec = Float64[]
+    sizes = map(args) do a
+        if a isa Number && !(a isa Integer)
+            wvec = vcat(wvec, a)
+            1
+        elseif a isa AbstractArray
+            wvec = vcat(wvec, vec(a))
+            size(a)
+        else
+            NonDiff(a)
+        end
+    end
+    if length(x) > length(wvec)
+        wvec = vcat(wvec, rand(length(x) - length(wvec)))  # maybe should be NaN?
+    end
+    ForwardDiff.jacobian(wvec) do wv
+        pos = 0
+        argsplus = map(sizes) do s
+            if s == 1
+                i = pos+=1
+                wv[i]
+            elseif s isa Tuple
+                i = pos+1
+                j = pos+=prod(s)
+                reshape(wv[i:j], s)
+            elseif s isa NonDiff
+                s.val
+            end
+        end
+        f(argsplus...)
+    end
+end
+
+# Some piracy:
 
 function Base.isapprox(x::NamedTuple, y::NamedTuple; kw...)
     Set(propertynames(x)) == Set(propertynames(y)) || return false

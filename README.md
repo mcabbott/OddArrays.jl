@@ -82,7 +82,7 @@ Perhaps these arrays which are nonlinear functions of their fields should instea
 
 ## Structural gradients
 
-The operation we want is the pullback of `collect`, which is called `uncollect` here. Some arrays have their own; the (slow but not wrong) fallback version uses Zygote's `pullback` and the array's own `getinidex`.
+The operation we want is the pullback of `collect`, which is called `uncollect` here. Some arrays have their own; the (slow but not wrong) fallback version uses Zygote's `pullback` and the array's own `getindex`.
 
 ```julia
 julia> uncollect([0 1; 0 0], Vandermonde([3,4]))
@@ -174,15 +174,17 @@ These obey the following properties, all of them a bit trivial:
 x = Diagonal(rand(3))
 dx = rand(3,3); dx2 = randn(3,3)
 
-# same subspace as uncollect sees:
-@test uncollect(naturalise(uncollect(dx, x), x), x) ≈ uncollect(dx, x)
+@testset "simple naturalise checks for x::$(typeof(x).name.name)" begin
+  # doesn't forget things which uncollect remembers:
+  @test uncollect(naturalise(uncollect(dx, x), x), x) ≈ uncollect(dx, x)
 
-# linearity (using that of uncollect):
-@test naturalise(uncollect(33 * dx, x), x) ≈ 33 * naturalise(uncollect(dx, x), x)
-@test naturalise(uncollect(dx + dx2, x), x) ≈ naturalise(uncollect(dx, x), x) + naturalise(uncollect(dx2, x), x)
+  # linearity (using that of uncollect):
+  @test naturalise(uncollect(33 * dx, x), x) ≈ 33 * naturalise(uncollect(dx, x), x)
+  @test naturalise(uncollect(dx + dx2, x), x) ≈ naturalise(uncollect(dx, x), x) + naturalise(uncollect(dx2, x), x)
 
-# this defines restrict:
-@test restrict(dx, x) ≈ naturalise(uncollect(dx, x), x)
+  # this defines restrict in terms of naturalise:
+  @test restrict(dx, x) ≈ naturalise(uncollect(dx, x), x)
+end
 ```
 
 These are also satisfied by `x = Full(2,3,3)`, if the action of `restrict` & `naturalise` is this:
@@ -200,12 +202,45 @@ julia> naturalise((value = 15, size = nothing), Full(pi,1,3))  # needs the size
  5.0  5.0  5.0                # value / length
 ```
 
-Is there any freedom here? `naturalise` has access to only one number. If it makes a `Full`, the scale is fixed. But why should it not produce say `[15 0 0]`? This is in the same equivalence class as `[10 0 5]` and `[5 5 5]` according to `uncollect`.
+What those tests don't check is that `naturalise` maps into the cotangent subspace corresponding to the submanifold defined by the type.
+This is a bit more involved to check, but is the argument against this returning say `[15 0 0]`, which is in the same equivalence class as `[10 0 5]` and `[5 5 5]` according to `uncollect`.
+You can try the above tests with `x = Full(2.0, 3, 3; one=true)`, but the new check is this:
 
-You can try this out as `Full(2,3,3; one=true)`. Is this just unaesthetic or will it ever give wrong answers? Tests pass. And what exactly is the mathematical condition which would forbid this, if we wanted to --- that we stay somehow within the natural embedding of the subspace?
+```julia
+julia> restrict([10 0 5], Full(pi, 1, 3; one=true))
+1×3 OneElement(::Int64):
+ 15  0  0
 
+julia> subspacetest(Full, 2.0, 3, 3; one=true);
+┌ Warning: naturalise(dw, Full) has components in 8 directions outside T*S
+└ @ OddArrays ~/.julia/dev/OddArrays/src/OddArrays.jl:958
 
-For some of the types above, the constructor (from fields to an array) is not linear, so cannot be part of `restrict` or `naturalise`. It is nevertheless possible to derive a natural representation, at least sometimes. For example:
+julia> subspacetest(Full, 2.0, 3, 3);
+[ Info: naturalise(dw, Full) seems to live in T*S, as it should
+```
+
+Less obviously, there is a correct projection for `Range` objects:
+
+```julia
+julia> uncollect([1,1,13], Range(1,2,3))
+(start = 1.5, stop = 13.5, len = nothing)
+
+julia> naturalise(ans, Range(1,2,3))
+3-element Range{Float64}, with step = 6.0:
+ -1.0
+  5.0
+ 11.0
+
+julia> ans ≈ restrict([1,1,13], Range)
+true
+
+julia> x = Range(0,ℯ,5); dx = rand(5); dx2 = rand(5);  # for above @testset
+
+julia> subspacetest(Range, 1.2, 3.4, 5);
+[ Info: naturalise(dw, Range) seems to live in T*S, as it should
+```
+
+For rotation matrices, an example of `restrict` which passes the above tests but fails `subspacetest` is this:
 
 ```julia
 julia> restrict([1 2; 3 4], Rotation(pi/3))
@@ -213,10 +248,16 @@ julia> restrict([1 2; 3 4], Rotation(pi/3))
   0.0      3.83013
  -3.83013  0.0
 
-julia> x = Rotation(randn()); dx = randn(2,2); dx2 = randn(2,2);  # for above tests
+julia> x = Rotation(randn()); dx = randn(2,2); dx2 = randn(2,2);  # for above @testset
+
+julia> subspacetest(Rotation, pi/3);
+┌ Warning: naturalise(dw, Rotation) has components in 3 directions outside T*S
+└ @ OddArrays ~/.julia/dev/OddArrays/src/OddArrays.jl:958
+
 ```
 
-It's pretty that the cotangent lives in the Lie algebra, although really we aren't much involved in matrix multiplication here. It's not clear this is a particularly natural choice --- we could also pick a scaled rotation matrix, like the dual part of this:
+It's pretty that the cotangent lives in the Lie algebra, but in fact irrelevant.
+The way to stay inside the submanifold is to use the dual part of this, which you could represent as a scaled rotation matrix:
 
 ```julia
 julia> using ForwardDiff: Dual
@@ -227,9 +268,7 @@ julia> Rotation(Dual(pi/3, 1000))
  Dual{Nothing}(0.866025,500.0)   Dual{Nothing}(0.5,-866.025)
 ```
 
-Anyway, we could use `ProjectTo` to standardise on one of these instead of the `Tangent`. But it doesn't seem very useful to do so. While the forward pass of `*(::Rotation, ::Rotation)` is just addition, the gradient will tend to involve `*(::AntiSymOne, ::Rotation)` for which there are no pre-existing optimisations. It'll work, but via the most generic methods.
-
-Maybe that's the rule of thumb for all types where the embedding map is nonlinear in the fields?
+This can't be a `Rotation` struct, in fact that's obvious from the start as the cotangent representation has to be a vector space, but the sum of two rotation matrices is outside the set.
 
 
 ## Over-parameterised types
@@ -254,7 +293,7 @@ julia> gradient(x -> sum(abs2, x), Mask([1,NaN,3], [40,50,60]))  # with default 
 ((alpha = [2.0, 0.0, 6.0], beta = [0.0, 100.0, 0.0]),)
 ```
 
-Do they have "natural" ones? For `Mask` can you just add `alpha + beta`... can this go wrong?
+Do they have "natural" ones? For `Mask` can you just add `alpha + beta`:
 
 ```julia
 julia> restrict([1 2 3], Mask)
@@ -265,31 +304,46 @@ julia> naturalise((alpha = [2 0 6], beta = [0 100 0]), Mask)
 1×3 Matrix{Int64}:
  2  100  6
 
-julia> x = Mask([1,NaN,3], [40,50,60]); dx = randn(3); dx2 = randn(3);  # for tests above
+julia> x = Mask([1,NaN,3], [40,50,60]); dx = randn(3); dx2 = randn(3);  # for above @testset
+
+julia> subspacetest(Mask, [1,NaN,3], [40,50,60]);
+[ Info: naturalise(dw, Mask) seems to live in T*S, as it should
 
 julia> gradient(x -> x.beta[1]^2, x)  # reads a field which doesn't contribute... garbage primal?
 ([80.0, 0.0, 0.0],)
 ```
 
-For `Outer`, here are two representations of the same point, i.e. different fields describing the same matrix `x`. Can we prove this has no legal `naturalise` at all? 
+For `Outer`, there is more serious redundancy, `Outer([4], [9,9]) == Outer([6], [6,6]) == Outer([9], [4,4])` describe the matrix `x`. And the constructor is nonlinear.
+You can still make a valid `naturalise`, I think, but it's not trivial and it cannot in general re-use the struct:
 
 ```julia
-julia> Outer([5], [7]) == Outer([7], [5])
-true
-
-julia> uncollect([3;;], Outer([5], [7]))
-(x = [21], y = [15], size = nothing)
-
-julia> uncollect([3;;], Outer([7], [5]))
-(x = [15], y = [21], size = nothing)
-
-julia> uncollect([3 0 0; 0 0 0], Outer([5,5], [7,7,7]))
+julia> uncollect([3 0 0; 0 0 0], Outer([5,5], [7,7,7]))  # S is 4 dimensional here
 (x = [21, 0], y = [15, 0, 0], size = nothing)
 
-julia> sqrt.([21, 0] .* [15, 0, 0]' ./ [5,5] ./ [7,7,7]')  # nonlinear
+julia> naturalise(ans,  Outer([5,5], [7,7,7]))  # this cannot be written as Outer
 2×3 Matrix{Float64}:
- 3.0  0.0  0.0
- 0.0  0.0  0.0
+ 2.0   0.5   0.5
+ 1.0  -0.5  -0.5
+
+julia> uncollect(ans, Outer([5,5], [7,7,7]))
+(x = [21.0, -8.881784197001252e-16], y = [15.0, -8.881784197001252e-16, 0.0], size = nothing)
+
+julia> subspacetest(Outer, [5,6], [7,8,9]);
+[ Info: naturalise(dw, Outer) seems to live in T*S, as it should
+```
+
+The case `Outer(::Matrix, ::Number)` is simpler:
+
+```julia
+julia> uncollect([1 10 100], Outer([4 5 6], 7))
+(x = [7 70 700], y = 654, size = nothing)
+
+julia> naturalise(ans, Outer([4 5 6], 7))
+1×3 Matrix{Float64}:
+ 1.0  10.0  100.0
+
+julia> ans == Outer([1 10 100], 1) == Outer([2 20 200], 1/2)  # but no advantage
+true
 ```
 
 Next, `PDiagMat` stores both the diagonal and its inverse. It specialises `*` of two such to produce a third, and opts out of the generic rule:
@@ -320,13 +374,11 @@ Haven't sorted these ones out.
 
 ## Discussed elsewhere
 
-This PR https://github.com/JuliaDiff/ChainRulesCore.jl/pull/449 contains some comparable maps, with more confusing names. (Formatted [notes.md](https://github.com/JuliaDiff/ChainRulesCore.jl/blob/wct/writing-generic-rrules/notes.md) and [examples](https://github.com/JuliaDiff/ChainRulesCore.jl/blob/wct/writing-generic-rrules/examples.jl).) I'm ignoring anything to do with forward mode entirely, "tangent" not "cotangent" there.
+This PR https://github.com/JuliaDiff/ChainRulesCore.jl/pull/449 contains some comparable maps. (Formatted [notes.md](https://github.com/JuliaDiff/ChainRulesCore.jl/blob/wct/writing-generic-rrules/notes.md) and [examples](https://github.com/JuliaDiff/ChainRulesCore.jl/blob/wct/writing-generic-rrules/examples.jl).)
 
 * Since `destructure == collect`, the useful map from Matrix to Tangent is called `destructure_pullback` or else `pullback_of_destructure(x)(dx)` for `uncollect(dx, x)` here.
 
-* There is also a "Restructure", and I think `pullback_of_restructure` is playing a role like `naturalise` here. But I am not very sure. Is the claim for `Fill` that its scale is arbitrary?
+* There is also a "Restructure", and I think `pullback_of_restructure` is playing a role like `naturalise` here. But I am not very sure.
 
 * The `ScaledVector` example there is much like `Outer(pi, [0 1 2])` here, but `Outer` allows other things.
-
-In addition to this story about subspaces and representations, there's a specific proposal to replace the fairly permissive behaviour of ChainRules (natural or structural both allowed by default, generic rules assume the former) with one which is all-Tangent all the time. I called that "the nuclear option" in https://github.com/JuliaDiff/ChainRulesCore.jl/issues/441 .
 
